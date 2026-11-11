@@ -130,11 +130,8 @@ final class ActivityScreen implements AutoCloseable {
                 prefs = loaded;
             }
             var log = ActivityLog.get(activity);
-            var events = log.query(new ActivityLog.Query(wanted == Scope.BLOCKED, uid, LIMIT))
-                    .stream()
-                    .filter(e -> wanted != Scope.ALLOWED || !e.blocked())
-                    .filter(e -> needle.isEmpty() || e.name().toLowerCase(Locale.ROOT).contains(needle))
-                    .toList();
+            var events = log.query(new ActivityLog.Query(false, uid, LIMIT)
+                    .filtered(wanted == Scope.BLOCKED, wanted == Scope.ALLOWED, needle));
             long midnight = LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli();
             long blockedToday = log.blockedSince(midnight);
             var settings = loaded.settings();

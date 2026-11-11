@@ -1,6 +1,10 @@
 package com.akeeper.vpn;
 
+import android.app.AlarmManager;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
@@ -9,6 +13,7 @@ import android.net.VpnService;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.SystemClock;
 
 import com.akeeper.engine.NativeEngine;
 import com.akeeper.rules.RuleStore;
@@ -44,6 +49,8 @@ public final class ShieldVpnService extends VpnService {
     private NetworkStateMonitor networkStateMonitor;
     private NetworkState networkState = NetworkState.NONE;
     private ShieldStatus.Subscription appRules;
+    private BroadcastReceiver packageChanges;
+    private AppRules rulesByApp;
     private RuleStore.Subscription ruleUpdates;
     private ShieldStatus.Subscription prefsChanges;
     private ShieldStatus.Subscription listsChanges;
@@ -87,6 +94,11 @@ public final class ShieldVpnService extends VpnService {
             stopSelf();
             return START_NOT_STICKY;
         }
+        // La minuterie du Handler et l'horloge du moteur s'arrêtent pendant la veille profonde : l'échéance murale
+        // est revérifiée à chaque commande, par exemple au retour dans l'app.
+        if (pausedUntil > 0 && System.currentTimeMillis() >= pausedUntil) {
+            endPause();
+        }
         // Seule l'action est lue : un Intent reçu n'est jamais relancé tel quel.
         var action = intent == null ? null : intent.getAction();
         if (ACTION_PAUSE.equals(action)) {
@@ -106,10 +118,20 @@ public final class ShieldVpnService extends VpnService {
         pausedUntil = System.currentTimeMillis() + PAUSE_MILLIS;
         main.removeCallbacks(endPause);
         main.postDelayed(endPause, PAUSE_MILLIS);
+        // Réveil inexact sur l'horloge qui avance en veille : la reprise ne dépend pas du CPU éveillé.
+        getSystemService(AlarmManager.class).setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + PAUSE_MILLIS, resumeIntent());
+    }
+
+    /** Intent explicite et immuable vers ce service : l'alarme ne peut rien lancer d'autre. */
+    private PendingIntent resumeIntent() {
+        return PendingIntent.getService(this, 0,
+                new Intent(this, ShieldVpnService.class).setAction(ACTION_RESUME), PendingIntent.FLAG_IMMUTABLE);
     }
 
     private void endPause() {
         main.removeCallbacks(endPause);
+        getSystemService(AlarmManager.class).cancel(resumeIntent());
         pausedUntil = 0;
         if (engine != null) {
             engine.resume();
@@ -160,8 +182,13 @@ public final class ShieldVpnService extends VpnService {
         ruleUpdates = rules.observe(() -> reloadRules(running, rules, preferences));
         listsChanges = UserLists.get(this).observe(lists -> reloadRules(running, rules, preferences));
         if (preferences != null) {
+            // Journal, conservation et réseau local ne changent pas les règles : seul le masque de catégories compte.
+            var appliedMask = new java.util.concurrent.atomic.AtomicInteger(categoryMask(preferences));
             prefsChanges = preferences.observe(settings -> {
-                reloadRules(running, rules, preferences);
+                int mask = RuleCategory.mask(settings.disabledCategories());
+                if (appliedMask.getAndSet(mask) != mask) {
+                    reloadRules(running, rules, preferences);
+                }
                 main.post(() -> onLanOption(settings));
             });
         }
@@ -225,12 +252,35 @@ public final class ShieldVpnService extends VpnService {
             // Moteur capturé : l'observateur tourne sur le thread de l'UI qui écrit les règles, pendant qu'un
             // arrêt peut remettre le champ à null. Après close(), setBlockedUids() est simplement sans effet.
             var current = engine;
-            appRules = AppRules.get(this).observe(packages ->
+            rulesByApp = AppRules.get(this);
+            appRules = rulesByApp.observe(packages ->
                     current.setBlockedUids(AppRules.uids(getPackageManager(), packages)));
+            watchPackages(current);
         } catch (GeneralSecurityException | IOException keystoreUnavailable) {
             // Keystore indisponible : aucune règle par app, mais le filtrage DNS et l'anti-évasion restent actifs.
             appRules = null;
         }
+    }
+
+    /**
+     * Une app bloquée puis réinstallée reçoit un nouvel UID : sans ce recalcul, elle échapperait au pare-feu jusqu'au
+     * prochain redémarrage du service.
+     */
+    private void watchPackages(NativeEngine current) {
+        var filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        filter.addDataScheme("package");
+        packageChanges = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                var rules = rulesByApp;
+                if (rules != null) {
+                    current.setBlockedUids(AppRules.uids(getPackageManager(), rules.blocked()));
+                }
+            }
+        };
+        registerReceiver(packageChanges, filter, RECEIVER_NOT_EXPORTED);
     }
 
     /** Appelé depuis le thread natif : protect() et getConnectionOwnerUid() sont sûrs hors thread principal. */
@@ -325,6 +375,7 @@ public final class ShieldVpnService extends VpnService {
 
     private void shutdown() {
         main.removeCallbacks(endPause);
+        getSystemService(AlarmManager.class).cancel(resumeIntent());
         pausedUntil = 0;
         for (var subscription : new ShieldStatus.Subscription[]{prefsChanges, listsChanges}) {
             if (subscription != null) {
@@ -345,6 +396,11 @@ public final class ShieldVpnService extends VpnService {
             appRules.close();
             appRules = null;
         }
+        if (packageChanges != null) {
+            unregisterReceiver(packageChanges);
+            packageChanges = null;
+        }
+        rulesByApp = null;
         if (networkStateMonitor != null) {
             networkStateMonitor.close();
             networkStateMonitor = null;

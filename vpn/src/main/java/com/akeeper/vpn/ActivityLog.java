@@ -22,16 +22,25 @@ import java.util.List;
 public final class ActivityLog {
 
     /** Filtres de l'écran Activité (A4) et de la fiche d'une app (A3). */
-    public record Query(boolean blockedOnly, int uid, int limit) {
+    public record Query(boolean blockedOnly, int uid, int limit, boolean allowedOnly, String text) {
         public static final int ANY_UID = Integer.MIN_VALUE;
+
+        public Query(boolean blockedOnly, int uid, int limit) {
+            this(blockedOnly, uid, limit, false, "");
+        }
 
         public static Query all(int limit) {
             return new Query(false, ANY_UID, limit);
         }
+
+        /** Filtres appliqués par SQL : sinon ils ne porteraient que sur les {@code limit} dernières lignes. */
+        public Query filtered(boolean blockedOnly, boolean allowedOnly, String text) {
+            return new Query(blockedOnly, uid, limit, allowedOnly, text == null ? "" : text);
+        }
     }
 
     private static final String DATABASE = "activity.db";
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
     private static final String TRAFFIC = "traffic";
     private static final long HOUR = 3_600_000L;
     private static final String TABLE = "events";
@@ -109,6 +118,15 @@ public final class ActivityLog {
         var args = new ArrayList<String>();
         if (query.blockedOnly()) {
             where.add("blocked = 1");
+        }
+        if (query.allowedOnly()) {
+            where.add("blocked = 0");
+        }
+        if (!query.text().isEmpty()) {
+            // Échappement de LIKE : le texte saisi est littéral. LIKE ignore la casse ASCII.
+            where.add("name LIKE ? ESCAPE '\\'");
+            args.add("%" + query.text().toLowerCase(java.util.Locale.ROOT)
+                    .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%");
         }
         if (query.uid() != Query.ANY_UID) {
             where.add("uid = ?");
@@ -231,6 +249,7 @@ public final class ActivityLog {
                     + " count INTEGER NOT NULL)");
             db.execSQL("CREATE INDEX events_ts ON " + TABLE + " (ts)");
             db.execSQL("CREATE INDEX events_uid ON " + TABLE + " (uid, ts)");
+            db.execSQL("CREATE INDEX events_blocked ON " + TABLE + " (blocked, ts)");
             createTraffic(db);
         }
 
@@ -243,6 +262,9 @@ public final class ActivityLog {
         public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
             if (oldVersion < 2) {
                 createTraffic(db);
+            }
+            if (oldVersion < 3) {
+                db.execSQL("CREATE INDEX events_blocked ON " + TABLE + " (blocked, ts)");
             }
         }
     }
